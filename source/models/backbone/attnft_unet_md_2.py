@@ -428,14 +428,46 @@ class AttentionUNet2D(nn.Module):
             return feat, f, a
 
         if level == "enc1" and "enc1" in self.fft_scales:
-            x_ds = F.interpolate(x_in, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+            # 使用频域裁剪代替空域插值下采样
+            target_H, target_W = feat.shape[-2:]
+            B, C, H, W = x_in.shape
+            
+            # 计算FFT并中心化
+            X = torch.fft.fft2(x_in, norm="ortho")
+            Xc = _fftshift2d(X)
+            
+            # 频域裁剪到目标分辨率
+            crop_H, crop_W = target_H, target_W
+            start_H, start_W = (H - crop_H) // 2, (W - crop_W) // 2
+            Xc_crop = Xc[..., start_H:start_H+crop_H, start_W:start_W+crop_W]
+            
+            # 反中心化并IFFT得到下采样的空域图像
+            X_crop = _fftshift2d(Xc_crop)
+            x_ds = torch.fft.ifft2(X_crop, norm="ortho").real
+            
             f = self.fft1(x_ds)
             feat = self.fuse1(feat, f)
             a = float(torch.sigmoid(self.fuse1.alpha_logit).detach().cpu().item())
             return feat, f, a
 
         if level == "enc2" and "enc2" in self.fft_scales:
-            x_ds = F.interpolate(x_in, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+            # 使用频域裁剪代替空域插值下采样
+            target_H, target_W = feat.shape[-2:]
+            B, C, H, W = x_in.shape
+            
+            # 计算FFT并中心化
+            X = torch.fft.fft2(x_in, norm="ortho")
+            Xc = _fftshift2d(X)
+            
+            # 频域裁剪到目标分辨率
+            crop_H, crop_W = target_H, target_W
+            start_H, start_W = (H - crop_H) // 2, (W - crop_W) // 2
+            Xc_crop = Xc[..., start_H:start_H+crop_H, start_W:start_W+crop_W]
+            
+            # 反中心化并IFFT得到下采样的空域图像
+            X_crop = _fftshift2d(Xc_crop)
+            x_ds = torch.fft.ifft2(X_crop, norm="ortho").real
+            
             f = self.fft2(x_ds)
             feat = self.fuse2(feat, f)
             a = float(torch.sigmoid(self.fuse2.alpha_logit).detach().cpu().item())

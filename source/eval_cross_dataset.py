@@ -1,19 +1,23 @@
 # eval_cross_dataset.py
-# Cross-dataset evaluation for BUSI-trained checkpoint on BUSBRA (or any flat dataset)
-# Upgrades (this version):
-# 1) Global (pixel-wise) metrics via accumulated confusion (same as your current)
+# Cross-dataset evaluation for any flat dataset (BUSI_flat / BUSBRA_flat / ...)
+# Features:
+# 1) Global (pixel-wise) metrics via accumulated confusion
 # 2) Per-case Dice (image-wise) + mean/median/std + percentiles
-#    - Handles GT-empty cases explicitly:
-#      * dice_empty="skip": exclude GT-empty images from per-case mean (recommended for BUSBRA no-normal)
-#      * dice_empty="one":  if GT empty and Pred empty -> dice=1 else 0
-#      * dice_empty="zero": if GT empty -> dice=0 (harsh; usually not desired)
-# 3) Keeps your EMA preference, robust output parsing, TTA, and visualization behavior
+# 3) GT-empty (normal) handling:
+#    - Per-case policy via --dice_empty {skip,one,zero}
+#    - Global metrics can optionally skip GT-empty via --skip_gt_empty_global
+#    - Optional dual-report: always print BOTH All-cases and Lesion-only global metrics via --report_both_global
+# 4) EMA preference, robust output parsing, TTA, visualization
+#
+# Expected flat structure:
+#   root/
+#     images/{id}.png
+#     masks/{id}.png
+#     splits/{split}.txt
 
 import argparse
 from pathlib import Path
 import random
-import math
-
 import numpy as np
 from PIL import Image
 
@@ -31,7 +35,6 @@ from source.models.backbone.attention_fft_unet2d import AttentionUNet2D as Atten
 from source.models.backbone.attnft_unet_md import AttentionUNet2D as AttentionFFTUNet2D_MD
 
 try:
-    # optional (if you trained with MD2)
     from source.models.backbone.attnft_unet_md_2 import AttentionUNet2D as AttentionFFTUNet2D_MD2
 except Exception:
     AttentionFFTUNet2D_MD2 = None
@@ -118,7 +121,7 @@ def build_model(backbone: str, in_channels=1, num_classes=2):
     raise ValueError(f"Unknown backbone: {backbone}")
 
 
-def pick_state_dict_from_ckpt(ckpt: dict, prefer_ema: bool = True) -> tuple[dict, str]:
+def pick_state_dict_from_ckpt(ckpt: dict, prefer_ema: bool = True):
     """
     Prefer EMA weights if present and non-empty.
     Returns (state_dict, which)
@@ -210,18 +213,20 @@ def metrics_from_totals(tp, fp, fn, tn):
 
 
 @torch.no_grad()
-def per_case_dice(pred01: torch.Tensor, y01: torch.Tensor, empty_policy: str = "skip") -> list[float]:
+def per_case_dice(pred01: torch.Tensor, y01: torch.Tensor, empty_policy: str = "skip"):
     """
     pred01, y01: [B,H,W] {0,1}
     empty_policy:
       - "skip": exclude GT-empty cases from the returned list
       - "one":  if GT empty and Pred empty -> dice=1 else 0
       - "zero": if GT empty -> dice=0 regardless
-    returns list of dice floats, one per selected case
+    returns list of dice floats (one per selected case)
     """
     assert empty_policy in ["skip", "one", "zero"]
     B = pred01.size(0)
     out = []
+    skipped_empty = 0
+
     for i in range(B):
         p = pred01[i].bool()
         y = y01[i].bool()
@@ -230,6 +235,7 @@ def per_case_dice(pred01: torch.Tensor, y01: torch.Tensor, empty_policy: str = "
 
         if y_sum == 0:
             if empty_policy == "skip":
+                skipped_empty += 1
                 continue
             if empty_policy == "zero":
                 out.append(0.0)
@@ -243,10 +249,11 @@ def per_case_dice(pred01: torch.Tensor, y01: torch.Tensor, empty_policy: str = "
         fn = ((~p) & y).sum().float()
         d = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
         out.append(float(d.item()))
-    return out
+
+    return out, skipped_empty
 
 
-def summarize_list(vals: list[float]) -> dict:
+def summarize_list(vals):
     if len(vals) == 0:
         return {
             "n": 0, "mean": None, "median": None, "std": None,
@@ -330,6 +337,23 @@ def predict_probs(model, x: torch.Tensor, tta_flip: bool = False):
 
 
 # -------------------------
+# Pretty printing
+# -------------------------
+def print_global_block(title: str, scalars: dict, pred_fg_ratio: float, fp_rate_empty, empty_total, empty_fp):
+    print(f"\n===== {title} =====")
+    print(f"Dice(FG):   {scalars['dice']:.4f}")
+    print(f"IoU:        {scalars['iou']:.4f}")
+    print(f"Precision:  {scalars['precision']:.4f}")
+    print(f"Recall:     {scalars['recall']:.4f}")
+    print(f"Accuracy:   {scalars['accuracy']:.4f}")
+    print(f"Pred FG %:  {pred_fg_ratio*100:.2f}%")
+    if fp_rate_empty is not None:
+        print(f"GT-empty FP rate: {fp_rate_empty:.4f}  (empty={empty_total}, fp_on_empty={empty_fp})")
+    else:
+        print("GT-empty FP rate: N/A (no empty GT samples in this split)")
+
+
+# -------------------------
 # Main
 # -------------------------
 def main():
@@ -343,11 +367,24 @@ def main():
     ap.add_argument("--tta_flip", action="store_true", help="Test-time augmentation: hflip + average probs")
     ap.add_argument("--prefer_ema", action="store_true", help="Prefer EMA weights if checkpoint contains them")
     ap.add_argument("--strict", action="store_true", help="Use strict=True when loading state_dict")
+
     ap.add_argument("--save_vis", action="store_true", help="Save overlay visualizations")
     ap.add_argument("--vis_n", type=int, default=24, help="How many images to visualize (random sample)")
     ap.add_argument("--out_dir", type=str, default="eval_vis", help="Root output dir for visualizations")
+    ap.add_argument("--skip_gt_empty_vis", action="store_true",
+                    help="If set, GT-empty (normal) cases won't be saved in visualization even if sampled.")
+
     ap.add_argument("--dice_empty", type=str, default="skip", choices=["skip", "one", "zero"],
                     help="Per-case dice policy for GT-empty samples")
+
+    # KEY: skip GT-empty in GLOBAL metrics (lesion-only global)
+    ap.add_argument("--skip_gt_empty_global", action="store_true",
+                    help="If set, GT-empty (normal) cases are excluded from GLOBAL pixel-wise metrics too.")
+
+    # Extra: print BOTH global metrics blocks (All-cases + Lesion-only) for reports
+    ap.add_argument("--report_both_global", action="store_true",
+                    help="If set, prints BOTH global metrics: All-cases and Lesion-only (GT-non-empty).")
+
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -367,7 +404,6 @@ def main():
         raise ValueError("Checkpoint missing 'backbone'. Please save it in training ckpt.")
 
     model = build_model(backbone, in_channels=1, num_classes=2).to(device)
-
     state_dict, which = pick_state_dict_from_ckpt(ckpt, prefer_ema=bool(args.prefer_ema))
     missing, unexpected = model.load_state_dict(state_dict, strict=bool(args.strict))
     model.eval()
@@ -383,6 +419,7 @@ def main():
 
     print(f"Eval on: {args.data_root} split={args.split} device={device} tta_flip={bool(args.tta_flip)}")
     print(f"Per-case dice: dice_empty_policy={args.dice_empty}")
+    print(f"Global skip GT-empty: {bool(args.skip_gt_empty_global)} | report_both_global: {bool(args.report_both_global)}")
 
     ds = FlatSegDataset(args.data_root, args.split, image_size=image_size)
     loader = DataLoader(
@@ -393,26 +430,31 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
-    # Global confusion totals (pixel-wise)
-    tp = torch.tensor(0.0)
-    fp = torch.tensor(0.0)
-    fn = torch.tensor(0.0)
-    tn = torch.tensor(0.0)
+    # Global totals: All-cases
+    tp_all = torch.tensor(0.0)
+    fp_all = torch.tensor(0.0)
+    fn_all = torch.tensor(0.0)
+    tn_all = torch.tensor(0.0)
+    pred_fg_sum_all = 0.0
+    pred_fg_cnt_all = 0
 
-    # GT-empty FP rate (image-wise)
+    # Global totals: Lesion-only (GT-non-empty)
+    tp_les = torch.tensor(0.0)
+    fp_les = torch.tensor(0.0)
+    fn_les = torch.tensor(0.0)
+    tn_les = torch.tensor(0.0)
+    pred_fg_sum_les = 0.0
+    pred_fg_cnt_les = 0
+
+    # GT-empty FP rate (image-wise) computed over ALL samples (this is useful to keep)
     gt_empty_total = 0
     gt_empty_fp = 0
 
-    # Predicted FG ratio (pixel-wise), averaged per-image
-    pred_fg_sum = 0.0
-    pred_fg_count = 0
-
     # Per-case dice list
-    percase_dices: list[float] = []
-    percase_included = 0
-    percase_skipped_empty = 0
+    percase_dices = []
+    percase_skipped_empty_total = 0
 
-    # Visualization sampling (sample indices in dataset space)
+    # Visualization sampling
     want_vis = bool(args.save_vis)
     vis_dir = Path(args.out_dir) / f"{Path(args.data_root).name}_{args.split}"
     vis_indices = set()
@@ -428,52 +470,69 @@ def main():
             y = y.to(device, non_blocking=True)  # [B,H,W]
 
             p = predict_probs(model, x, tta_flip=bool(args.tta_flip))  # [B,2,H,W]
-            pred = torch.argmax(p, dim=1)  # [B,H,W], 0/1
+            pred = torch.argmax(p, dim=1)  # [B,H,W]
 
-            # accumulate global confusion
+            # -------------------------
+            # GT-empty bookkeeping (per-sample)
+            # -------------------------
+            y_sum = y.flatten(1).sum(dim=1)  # [B]
+            is_empty = (y_sum == 0)
+            is_nonempty = ~is_empty
+
+            gt_empty_total += int(is_empty.sum().item())
+            if is_empty.any():
+                # count empty samples where pred has any fg
+                pred_sum = pred[is_empty].flatten(1).sum(dim=1)
+                gt_empty_fp += int((pred_sum > 0).sum().item())
+
+            # -------------------------
+            # GLOBAL metrics: All-cases (always accumulate)
+            # -------------------------
             btp, bfp, bfn, btn = batch_confusion(pred, y)
-            tp += btp.cpu()
-            fp += bfp.cpu()
-            fn += bfn.cpu()
-            tn += btn.cpu()
+            tp_all += btp.cpu()
+            fp_all += bfp.cpu()
+            fn_all += bfn.cpu()
+            tn_all += btn.cpu()
 
-            # pred fg ratio (per-image average)
-            pred_fg_sum += float(pred.float().mean().item()) * x.size(0)
-            pred_fg_count += x.size(0)
+            pred_fg_sum_all += float(pred.float().mean().item()) * x.size(0)
+            pred_fg_cnt_all += x.size(0)
 
-            # GT-empty FP rate (per-sample)
-            for bi in range(x.size(0)):
-                yi = y[bi]
-                pi = pred[bi]
-                if yi.sum().item() == 0:
-                    gt_empty_total += 1
-                    if pi.sum().item() > 0:
-                        gt_empty_fp += 1
+            # -------------------------
+            # GLOBAL metrics: Lesion-only (accumulate only GT-non-empty)
+            # -------------------------
+            if is_nonempty.any():
+                pred_k = pred[is_nonempty]
+                y_k = y[is_nonempty]
+                btp2, bfp2, bfn2, btn2 = batch_confusion(pred_k, y_k)
+                tp_les += btp2.cpu()
+                fp_les += bfp2.cpu()
+                fn_les += bfn2.cpu()
+                tn_les += btn2.cpu()
 
-            # per-case dice
-            before = len(percase_dices)
-            percase_dices.extend(per_case_dice(pred, y, empty_policy=args.dice_empty))
-            after = len(percase_dices)
+                pred_fg_sum_les += float(pred_k.float().mean().item()) * int(is_nonempty.sum().item())
+                pred_fg_cnt_les += int(is_nonempty.sum().item())
 
-            # bookkeeping for "skip"
-            if args.dice_empty == "skip":
-                # count how many GT-empty were skipped in this batch
-                for bi in range(x.size(0)):
-                    if int(y[bi].sum().item()) == 0:
-                        percase_skipped_empty += 1
-                percase_included += (after - before)
-            else:
-                percase_included += x.size(0)
+            # -------------------------
+            # Per-case dice
+            # -------------------------
+            dices_batch, skipped_empty = per_case_dice(pred, y, empty_policy=args.dice_empty)
+            percase_dices.extend(dices_batch)
+            percase_skipped_empty_total += skipped_empty
 
-            # visualization: save selected samples by global dataset index
+            # -------------------------
+            # Visualization
+            # -------------------------
             if want_vis:
                 selected = []
                 selected_sids = []
                 for bi in range(x.size(0)):
                     gidx = idx_base + bi
                     if gidx in vis_indices:
+                        if args.skip_gt_empty_vis and int(y[bi].sum().item()) == 0:
+                            continue
                         selected.append(bi)
                         selected_sids.append(sids[bi])
+
                 if selected:
                     xb = x[selected]
                     yb = y[selected]
@@ -482,30 +541,46 @@ def main():
 
             idx_base += x.size(0)
 
-    # final global metrics
-    scalars = metrics_from_totals(tp, fp, fn, tn)
-    pred_fg_ratio = (pred_fg_sum / max(1, pred_fg_count))
+    # -------------------------
+    # Final metrics
+    # -------------------------
+    # FP rate on GT-empty images (kept over all samples)
     fp_rate_empty = (gt_empty_fp / gt_empty_total) if gt_empty_total > 0 else None
 
-    # per-case summary
-    percase_summary = summarize_list(percase_dices)
+    scalars_all = metrics_from_totals(tp_all, fp_all, fn_all, tn_all)
+    pred_fg_ratio_all = pred_fg_sum_all / max(1, pred_fg_cnt_all)
 
-    print("\n===== Cross-dataset evaluation (GLOBAL pixel-wise) =====")
-    print(f"Dice(FG):   {scalars['dice']:.4f}")
-    print(f"IoU:        {scalars['iou']:.4f}")
-    print(f"Precision:  {scalars['precision']:.4f}")
-    print(f"Recall:     {scalars['recall']:.4f}")
-    print(f"Accuracy:   {scalars['accuracy']:.4f}")
-    print(f"Pred FG %:  {pred_fg_ratio*100:.2f}%")
-    if fp_rate_empty is not None:
-        print(f"GT-empty FP rate: {fp_rate_empty:.4f}  (empty={gt_empty_total}, fp_on_empty={gt_empty_fp})")
+    scalars_les = metrics_from_totals(tp_les, fp_les, fn_les, tn_les)
+    pred_fg_ratio_les = pred_fg_sum_les / max(1, pred_fg_cnt_les)
+
+    # Decide which "main" global block to show (for backward compatibility)
+    # If skip_gt_empty_global: use lesion-only as the main block; otherwise all-cases.
+    if args.skip_gt_empty_global:
+        main_title = "Cross-dataset evaluation (GLOBAL pixel-wise | LESION-ONLY, GT-non-empty)"
+        main_scalars = scalars_les
+        main_pred_fg = pred_fg_ratio_les
     else:
-        print("GT-empty FP rate: N/A (no empty GT samples in this split)")
+        main_title = "Cross-dataset evaluation (GLOBAL pixel-wise | ALL-CASES)"
+        main_scalars = scalars_all
+        main_pred_fg = pred_fg_ratio_all
+
+    # Always print the chosen main block
+    print_global_block(main_title, main_scalars, main_pred_fg, fp_rate_empty, gt_empty_total, gt_empty_fp)
+
+    # Optionally print both blocks (recommended for reports)
+    if args.report_both_global:
+        print_global_block("GLOBAL pixel-wise | ALL-CASES", scalars_all, pred_fg_ratio_all,
+                           fp_rate_empty, gt_empty_total, gt_empty_fp)
+        print_global_block("GLOBAL pixel-wise | LESION-ONLY (GT-non-empty)", scalars_les, pred_fg_ratio_les,
+                           fp_rate_empty, gt_empty_total, gt_empty_fp)
+
+    # Per-case summary
+    percase_summary = summarize_list(percase_dices)
 
     print("\n===== Per-case Dice (image-wise) =====")
     print(f"Policy (GT-empty): {args.dice_empty}")
     if args.dice_empty == "skip":
-        print(f"Included cases: {percase_summary['n']}  | Skipped GT-empty: {percase_skipped_empty}")
+        print(f"Included cases: {percase_summary['n']}  | Skipped GT-empty: {percase_skipped_empty_total}")
     else:
         print(f"Included cases: {percase_summary['n']}")
 
