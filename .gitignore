@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+
+raw_data/
+
+.vscode/
+
+.DS_Store
+
+viz/
+
+checkpoints_busi
