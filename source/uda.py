@@ -1,12 +1,14 @@
 # uda_step1_ema_pseudo.py
 # Step-1 UDA: Teacher-EMA + pseudo-label consistency (NO ROI, NO CutMix, NO disentangle yet)
-# - Source (BUSI): supervised loss
-# - Target (BUSBRA): EMA teacher generates pseudo labels; student learns with filtering
+# - Source: supervised loss
+# - Target: EMA teacher generates pseudo labels; student learns with filtering
 # - + Added: Optional Target validation metrics (global pixel-wise + per-case) for debugging
+# - + Added: Optional "drop GT-empty (normal)" for target train/val, and "lesion-only" target val metrics
 #
 # Notes:
 # - Target val is ONLY for monitoring/debugging (do NOT use it to pick best/early stop in "pure" UDA).
 # - By default we evaluate EMA(teacher) because it's more stable; you can also evaluate student.
+# - For BUSBRA(source) -> BUSI(target): BUSBRA has no normal; you may want to drop BUSI GT-empty from target train/val.
 
 import argparse
 from pathlib import Path
@@ -290,18 +292,59 @@ class FlatSegDatasetUnlabeled(Dataset):
     root/
       images/{id}.png
       splits/{split}.txt
+
+    Optional (for filtering normal):
+      masks/{id}.png   (used ONLY to decide GT-empty and drop it; NOT used as supervision)
     """
-    def __init__(self, root: str, split: str, image_size: int = 256, augment: bool = False):
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        image_size: int = 256,
+        augment: bool = False,
+        drop_gt_empty: bool = False,
+        gt_empty_thr: int = 0,
+        mask_dir_name: str = "masks",
+        verbose_filter: bool = True,
+    ):
         self.root = Path(root)
         self.image_size = int(image_size)
         self.augment = bool(augment)
 
         ids_path = self.root / "splits" / f"{split}.txt"
         assert ids_path.exists(), f"Missing split file: {ids_path}"
-        self.ids = [l.strip() for l in ids_path.read_text().splitlines() if l.strip()]
+        ids = [l.strip() for l in ids_path.read_text().splitlines() if l.strip()]
 
         self.img_dir = self.root / "images"
         assert self.img_dir.exists(), "Missing images/"
+
+        self.drop_gt_empty = bool(drop_gt_empty)
+        self.gt_empty_thr = int(gt_empty_thr)
+        self.mask_dir = self.root / mask_dir_name
+
+        if self.drop_gt_empty:
+            assert self.mask_dir.exists(), (
+                f"drop_gt_empty=True requires masks to exist for filtering, but not found: {self.mask_dir}"
+            )
+            kept = []
+            dropped = 0
+            for sid in ids:
+                mp = self.mask_dir / f"{sid}.png"
+                if not mp.exists():
+                    raise FileNotFoundError(f"Mask not found for filtering GT-empty: {mp}")
+                m = load_mask(mp)  # uint8 0/1
+                if int(m.sum()) <= self.gt_empty_thr:
+                    dropped += 1
+                    continue
+                kept.append(sid)
+            self.ids = kept
+            if verbose_filter:
+                print(
+                    f"[TargetFilter] split={split} drop_gt_empty=True thr={self.gt_empty_thr} "
+                    f"kept={len(self.ids)} dropped={dropped} (from {len(ids)})"
+                )
+        else:
+            self.ids = ids
 
     def __len__(self):
         return len(self.ids)
@@ -577,11 +620,8 @@ def eval_labeled_full(
                     gt_empty_fp += 1
 
         # per-case
-        before = len(percase_dices)
         percase_dices.extend(per_case_dice(pred, y, empty_policy=empty_policy))
-        after = len(percase_dices)
         if empty_policy == "skip":
-            # count how many GT-empty were skipped in this batch
             for bi in range(bs):
                 if int(y[bi].sum().item()) == 0:
                     percase_skipped_empty += 1
@@ -633,8 +673,8 @@ def main():
     ap = argparse.ArgumentParser()
 
     # data
-    ap.add_argument("--source_root", type=str, required=True, help="BUSI flat root")
-    ap.add_argument("--target_root", type=str, required=True, help="BUSBRA flat root (unlabeled for training)")
+    ap.add_argument("--source_root", type=str, required=True, help="Source flat root (labeled)")
+    ap.add_argument("--target_root", type=str, required=True, help="Target flat root (unlabeled for training)")
     ap.add_argument("--image_size", type=int, default=256)
 
     # train
@@ -681,8 +721,18 @@ def main():
     ap.add_argument("--eval_student", action="store_true",
                     help="If set, also evaluate student model (in addition to EMA teacher).")
 
-    # checkpoint init (optional): load BUSI pretrained and start UDA
-    ap.add_argument("--init_ckpt", type=str, default="", help="Optional: BUSI best.pt to initialize student weights")
+    # NEW: drop target GT-empty (normal) for training/val, and lesion-only target reporting
+    ap.add_argument("--tgt_drop_gt_empty_train", action="store_true",
+                    help="If set, drop GT-empty cases from TARGET TRAIN by reading masks for filtering (not supervision).")
+    ap.add_argument("--tgt_drop_gt_empty_val", action="store_true",
+                    help="If set, drop GT-empty cases from TARGET VAL dataset (monitoring only).")
+    ap.add_argument("--tgt_gt_empty_thr", type=int, default=0,
+                    help="Mask sum <= thr is treated as GT-empty for dropping.")
+    ap.add_argument("--tgt_val_lesion_only", action="store_true",
+                    help="If set, print an extra Target Val line computed on lesion-only (GT-non-empty) via empty_policy=skip.")
+
+    # checkpoint init (optional): load pretrained and start UDA
+    ap.add_argument("--init_ckpt", type=str, default="", help="Optional: pretrained best.pt to initialize student weights")
     ap.add_argument("--init_strict", action="store_true", help="strict load for init_ckpt")
 
     args = ap.parse_args()
@@ -697,6 +747,11 @@ def main():
     print(f"EMA decay={args.ema_decay}  lambda_pl={args.lambda_pl}")
     print(f"PL filter: conf>={args.pl_conf_thr} fg in [{args.pl_fg_min},{args.pl_fg_max}]")
     print(f"Eval: dice_empty={args.dice_empty} eval_target={bool(args.eval_target)} eval_student={bool(args.eval_student)}")
+    print(
+        "TargetFilter:",
+        f"drop_train={bool(args.tgt_drop_gt_empty_train)} drop_val={bool(args.tgt_drop_gt_empty_val)}",
+        f"thr={args.tgt_gt_empty_thr} tgt_val_lesion_only={bool(args.tgt_val_lesion_only)}",
+    )
 
     save_dir = Path(args.save_dir) / args.backbone
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -705,12 +760,43 @@ def main():
     src_train = FlatSegDatasetLabeled(args.source_root, "train", image_size=args.image_size, augment=(not args.no_aug))
     src_val   = FlatSegDatasetLabeled(args.source_root, "val",   image_size=args.image_size, augment=False)
 
-    tgt_train = FlatSegDatasetUnlabeled(args.target_root, "train", image_size=args.image_size, augment=(not args.no_aug))
+    tgt_train = FlatSegDatasetUnlabeled(
+        args.target_root, "train",
+        image_size=args.image_size,
+        augment=(not args.no_aug),
+        drop_gt_empty=bool(args.tgt_drop_gt_empty_train),
+        gt_empty_thr=int(args.tgt_gt_empty_thr),
+        mask_dir_name="masks",
+        verbose_filter=True,
+    )
 
     # optional (monitoring) target val uses masks
     tgt_val = None
     if args.eval_target:
         tgt_val = FlatSegDatasetLabeled(args.target_root, "val", image_size=args.image_size, augment=False)
+        if args.tgt_drop_gt_empty_val:
+            # drop GT-empty from target val by reusing the unlabeled filter logic on the val split,
+            # then wrap it as a labeled dataset by keeping only ids that are non-empty.
+            # simplest: filter ids here and overwrite tgt_val.ids
+            ids_all = tgt_val.ids
+            kept = []
+            dropped = 0
+            msk_dir = Path(args.target_root) / "masks"
+            assert msk_dir.exists(), f"tgt_drop_gt_empty_val=True but masks not found: {msk_dir}"
+            for sid in ids_all:
+                mp = msk_dir / f"{sid}.png"
+                if not mp.exists():
+                    raise FileNotFoundError(f"Mask not found for filtering target val: {mp}")
+                m = load_mask(mp)
+                if int(m.sum()) <= int(args.tgt_gt_empty_thr):
+                    dropped += 1
+                    continue
+                kept.append(sid)
+            tgt_val.ids = kept
+            print(
+                f"[TargetValFilter] drop_gt_empty_val=True thr={args.tgt_gt_empty_thr} "
+                f"kept={len(kept)} dropped={dropped} (from {len(ids_all)})"
+            )
 
     src_loader = DataLoader(
         src_train, batch_size=args.batch_size, shuffle=True,
@@ -736,12 +822,12 @@ def main():
     # model
     model = build_model(args.backbone).to(device)
 
-    # optional init from BUSI checkpoint (recommended)
+    # optional init from checkpoint
     if args.init_ckpt:
         ckpt = torch.load(args.init_ckpt, map_location="cpu")
-        sd = ckpt.get("ema_model", None) or ckpt.get("model", None)
-        if sd is None:
-            raise ValueError("init_ckpt missing 'model'/'ema_model'")
+        sd = ckpt.get("ema_model", None) or ckpt.get("model", None) or ckpt
+        if sd is None or (not isinstance(sd, dict)):
+            raise ValueError("init_ckpt missing a usable state_dict ('model'/'ema_model' or directly).")
         missing, unexpected = model.load_state_dict(sd, strict=bool(args.init_strict))
         print(f"[Init] loaded from {args.init_ckpt} strict={bool(args.init_strict)}")
         if not args.init_strict:
@@ -852,7 +938,7 @@ def main():
         lr_now = opt.param_groups[0]["lr"]
         keep_rate = pl_keep_sum / max(1, pl_total_sum)
 
-        # teacher/EMA eval
+        # teacher/EMA eval on SOURCE
         src_eval_t = eval_labeled_full(
             ema_model, src_val_loader, device, empty_policy=args.dice_empty, prefix="SRC_VAL"
         )
@@ -866,11 +952,19 @@ def main():
         )
         print("  " + format_eval_line("EMA " + src_eval_t["prefix"], src_eval_t))
 
+        # teacher/EMA eval on TARGET (monitoring only)
         if tgt_val_loader is not None:
             tgt_eval_t = eval_labeled_full(
                 ema_model, tgt_val_loader, device, empty_policy=args.dice_empty, prefix="TGT_VAL"
             )
             print("  " + format_eval_line("EMA " + tgt_eval_t["prefix"], tgt_eval_t))
+
+            # Extra: lesion-only target metrics (always empty_policy=skip)
+            if args.tgt_val_lesion_only:
+                tgt_eval_t_les = eval_labeled_full(
+                    ema_model, tgt_val_loader, device, empty_policy="skip", prefix="TGT_VAL_LESION_ONLY"
+                )
+                print("  " + format_eval_line("EMA " + tgt_eval_t_les["prefix"], tgt_eval_t_les))
 
         # optional student eval (often noisier)
         if args.eval_student:
@@ -883,6 +977,11 @@ def main():
                     model, tgt_val_loader, device, empty_policy=args.dice_empty, prefix="TGT_VAL"
                 )
                 print("  " + format_eval_line("STU " + tgt_eval_s["prefix"], tgt_eval_s))
+                if args.tgt_val_lesion_only:
+                    tgt_eval_s_les = eval_labeled_full(
+                        model, tgt_val_loader, device, empty_policy="skip", prefix="TGT_VAL_LESION_ONLY"
+                    )
+                    print("  " + format_eval_line("STU " + tgt_eval_s_les["prefix"], tgt_eval_s_les))
 
         # scheduler + best ckpt by SOURCE EMA dice (protect source performance)
         scheduler.step(src_eval_t["global"]["dice"])
@@ -902,6 +1001,10 @@ def main():
                 "pl_cfg": vars(pl_cfg),
                 "dice_empty": args.dice_empty,
                 "eval_target": bool(args.eval_target),
+                "tgt_drop_gt_empty_train": bool(args.tgt_drop_gt_empty_train),
+                "tgt_drop_gt_empty_val": bool(args.tgt_drop_gt_empty_val),
+                "tgt_gt_empty_thr": int(args.tgt_gt_empty_thr),
+                "tgt_val_lesion_only": bool(args.tgt_val_lesion_only),
             }
             torch.save(ckpt, save_dir / "best.pt")
             print(f"  ✓ saved best.pt (best_src_val_dice={best_src_val:.4f})")
